@@ -1,40 +1,97 @@
+
+
 import os
+import time
 import requests
 import pandas as pd
 import yfinance as yf
-import time
 from io import StringIO
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 
-# Telegram settings
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-# Bullish Marubozu definition
 BODY_PERCENT = 90
 WICK_PERCENT = 5
 
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": message},
-            timeout=15
-        )
-    except Exception as e:
-        print("Telegram error:", e)
+
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": CHAT_ID,
+                    "text": message
+                },
+                timeout=30
+            )
+
+            response.raise_for_status()
+            result = response.json()
+
+            if result.get("ok"):
+                print("Telegram alert sent successfully!")
+                return True
+
+            print("Telegram API error:", result)
+
+        except Exception as e:
+            print(f"Telegram attempt {attempt} failed:", e)
+
+        if attempt < 3:
+            time.sleep(5 * attempt)
+
+    print("Telegram failed after 3 attempts")
+    return False
+
+
+def send_alerts(alerts):
+    if not alerts:
+        print("No Bullish Marubozu found.")
+        return
+
+    header = "🚀 NSE BULLISH MARUBOZU ALERTS\n\n"
+    messages = []
+    current_message = header
+
+    for alert in alerts:
+        if len(current_message) + len(alert) > 3500:
+            messages.append(current_message)
+            current_message = header
+
+        current_message += alert + "\n"
+
+    if current_message != header:
+        messages.append(current_message)
+
+    print("Total alert messages:", len(messages))
+
+    for message in messages:
+        send_telegram(message)
+        time.sleep(2)
+
 
 def get_nse_stocks():
     url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
     headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers, timeout=30)
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=30
+    )
     response.raise_for_status()
+
     df = pd.read_csv(StringIO(response.text))
+
     return [
         str(symbol).strip() + ".NS"
         for symbol in df["SYMBOL"].dropna()
     ]
+
 
 def is_bullish_marubozu(candle):
     o = float(candle["Open"])
@@ -43,6 +100,7 @@ def is_bullish_marubozu(candle):
     c = float(candle["Close"])
 
     candle_range = h - l
+
     if candle_range <= 0 or c <= o:
         return False
 
@@ -60,14 +118,15 @@ def is_bullish_marubozu(candle):
         and lower_ratio <= WICK_PERCENT
     )
 
+
 def scan_stocks():
     print("Starting NSE scanner...")
+
     stocks = get_nse_stocks()
     print("Total stocks:", len(stocks))
 
     alerts = []
 
-    # Scan in batches to reduce data request failures
     for start in range(0, len(stocks), 50):
         batch = stocks[start:start + 50]
 
@@ -89,7 +148,9 @@ def scan_stocks():
                     else:
                         df = data[symbol]
 
-                    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+                    df = df.dropna(
+                        subset=["Open", "High", "Low", "Close"]
+                    )
 
                     if len(df) < 2:
                         continue
@@ -111,7 +172,8 @@ def scan_stocks():
 
                         alerts.append(message)
 
-                except Exception:
+                except Exception as e:
+                    print(f"Stock error {symbol}:", e)
                     continue
 
         except Exception as e:
@@ -119,11 +181,12 @@ def scan_stocks():
 
         time.sleep(1)
 
-    for alert in alerts:
-        send_telegram(alert)
-        print(alert)
+    print("Total Bullish Marubozu found:", len(alerts))
+
+    send_alerts(alerts)
 
     print("Scan completed:", datetime.now())
+
 
 if __name__ == "__main__":
     scan_stocks()
