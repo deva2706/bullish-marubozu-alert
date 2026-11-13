@@ -1,3 +1,4 @@
+import os
 import requests
 import pandas as pd
 import yfinance as yf
@@ -6,8 +7,8 @@ from io import StringIO
 from datetime import datetime, timedelta, timezone
 
 # Telegram settings
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # Bullish Marubozu definition
 BODY_PERCENT = 90
