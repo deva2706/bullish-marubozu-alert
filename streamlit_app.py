@@ -1,36 +1,49 @@
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import requests
+import plotly.graph_objects as go
+
 from io import StringIO
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 
-# ---------------- SETTINGS ----------------
+# ==================================================
+# SETTINGS
+# ==================================================
 
 st.set_page_config(
-    page_title="NSE FVG + Marubozu Scanner",
-    page_icon="📈",
+    page_title="Advanced NSE SMC Scanner",
+    page_icon="📊",
     layout="wide"
 )
 
 IST = ZoneInfo("Asia/Kolkata")
 NSE_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
-# ---------------- NSE STOCK LIST ----------------
+HISTORY_DAYS = 30
+YAHOO_PERIOD = "60d"
+INTERVAL = "5m"
+
+
+# ==================================================
+# NSE STOCK LIST
+# ==================================================
 
 @st.cache_data(ttl=3600)
 def get_nse_stocks():
+
     headers = {
         "User-Agent": "Mozilla/5.0",
-        "Accept": "text/csv,application/csv,*/*"
+        "Accept": "text/csv,*/*"
     }
 
     response = requests.get(
         NSE_URL,
         headers=headers,
-        timeout=20
+        timeout=30
     )
     response.raise_for_status()
 
@@ -43,45 +56,62 @@ def get_nse_stocks():
         .astype(str)
         .str.strip()
         .unique()
-        .tolist()
     )
 
-    return [symbol + ".NS" for symbol in symbols]
+    return [s + ".NS" for s in symbols if s]
 
 
-# ---------------- MARUBOZU CHECK ----------------
+# ==================================================
+# YAHOO DOWNLOAD
+# ==================================================
 
-def is_bullish_marubozu(candle):
+@st.cache_data(ttl=60, show_spinner=False)
+def download_batch(batch):
 
-    open_price = float(candle["Open"])
-    close_price = float(candle["Close"])
-    high_price = float(candle["High"])
-    low_price = float(candle["Low"])
-
-    candle_range = high_price - low_price
-
-    if candle_range <= 0:
-        return False
-
-    if close_price <= open_price:
-        return False
-
-    body = close_price - open_price
-    upper_wick = high_price - close_price
-    lower_wick = open_price - low_price
-
-    body_ratio = body / candle_range
-    upper_ratio = upper_wick / candle_range
-    lower_ratio = lower_wick / candle_range
-
-    return (
-        body_ratio >= 0.90
-        and upper_ratio <= 0.05
-        and lower_ratio <= 0.05
+    return yf.download(
+        tickers=list(batch),
+        period=YAHOO_PERIOD,
+        interval=INTERVAL,
+        group_by="ticker",
+        auto_adjust=False,
+        threads=True,
+        progress=False,
+        timeout=30
     )
 
 
-# ---------------- TIME CONVERSION ----------------
+def get_ticker_data(data, ticker):
+
+    if data is None or data.empty:
+        return pd.DataFrame()
+
+    if not isinstance(data.columns, pd.MultiIndex):
+        if len(data.columns) > 0:
+            return data.copy()
+        return pd.DataFrame()
+
+    for level in range(data.columns.nlevels):
+
+        if ticker in data.columns.get_level_values(level):
+            try:
+                result = data.xs(
+                    ticker,
+                    axis=1,
+                    level=level
+                )
+
+                if isinstance(result, pd.DataFrame):
+                    return result.copy()
+
+            except Exception:
+                pass
+
+    return pd.DataFrame()
+
+
+# ==================================================
+# PREPARE 5 MIN DATA
+# ==================================================
 
 def prepare_data(df, now):
 
@@ -93,9 +123,11 @@ def prepare_data(df, now):
     if isinstance(df.columns, pd.MultiIndex):
         return pd.DataFrame()
 
-    required = ["Open", "High", "Low", "Close"]
+    required = [
+        "Open", "High", "Low", "Close", "Volume"
+    ]
 
-    if not all(col in df.columns for col in required):
+    if not all(c in df.columns for c in required):
         return pd.DataFrame()
 
     if df.index.tz is None:
@@ -104,12 +136,14 @@ def prepare_data(df, now):
         df.index = df.index.tz_convert(IST)
 
     df = df[required].dropna()
-    df = df[~df.index.duplicated(keep="last")]
     df = df.sort_index()
 
-    # Ignore the candle that has not fully closed
-    closed_before = now - timedelta(minutes=5)
-    df = df[df.index <= closed_before]
+    df = df[~df.index.duplicated(keep="last")]
+
+    # Completed candles only
+    df = df[
+        df.index + timedelta(minutes=5) <= now
+    ]
 
     # NSE regular session
     df = df[
@@ -117,209 +151,984 @@ def prepare_data(df, now):
         & (df.index.time < time(15, 30))
     ]
 
+    # Last 30 calendar days
+    start_date = now - timedelta(days=HISTORY_DAYS)
+
+    df = df[
+        df.index >= start_date
+    ]
+
     return df
 
 
-# ---------------- PATTERN CHECK ----------------
+# ==================================================
+# MULTI TIMEFRAME
+# ==================================================
 
-def check_pattern(df, ticker, now):
+def resample_data(df, rule):
+
+    if df.empty:
+        return pd.DataFrame()
+
+    result = df.resample(rule).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    }).dropna()
+
+    return result
+
+
+def get_trend(df):
+
+    if len(df) < 20:
+        return "INSUFFICIENT DATA"
+
+    ema20 = df["Close"].ewm(
+        span=20, adjust=False
+    ).mean()
+
+    ema50 = df["Close"].ewm(
+        span=50, adjust=False
+    ).mean()
+
+    price = df["Close"].iloc[-1]
+
+    if price > ema20.iloc[-1] > ema50.iloc[-1]:
+        return "BULLISH"
+
+    if price < ema20.iloc[-1] < ema50.iloc[-1]:
+        return "BEARISH"
+
+    return "SIDEWAYS"
+
+
+def get_mtf_analysis(df):
+
+    frames = {
+        "5 Minute": df,
+        "15 Minute": resample_data(df, "15min"),
+        "1 Hour": resample_data(df, "1h"),
+        "4 Hour": resample_data(df, "4h"),
+        "Daily": resample_data(df, "1D")
+    }
+
+    return {
+        name: get_trend(frame)
+        for name, frame in frames.items()
+    }
+
+
+# ==================================================
+# PREVIOUS DAY / WEEK / MONTH LEVELS
+# ==================================================
+
+def get_previous_levels(df):
+
+    levels = {}
+
+    if df.empty:
+        return levels
+
+    daily = df.groupby(df.index.date).agg({
+        "High": "max",
+        "Low": "min"
+    })
+
+    if len(daily) >= 2:
+
+        levels["PDH"] = float(daily["High"].iloc[-2])
+        levels["PDL"] = float(daily["Low"].iloc[-2])
+
+    weekly = df.groupby(
+        df.index.to_period("W-FRI")
+    ).agg({
+        "High": "max",
+        "Low": "min"
+    })
+
+    if len(weekly) >= 2:
+
+        levels["PWH"] = float(weekly["High"].iloc[-2])
+        levels["PWL"] = float(weekly["Low"].iloc[-2])
+
+    monthly = df.groupby(
+        df.index.to_period("M")
+    ).agg({
+        "High": "max",
+        "Low": "min"
+    })
+
+    if len(monthly) >= 2:
+
+        levels["PMH"] = float(monthly["High"].iloc[-2])
+        levels["PML"] = float(monthly["Low"].iloc[-2])
+
+    return levels
+
+
+# ==================================================
+# ADVANCED SMC ANALYSIS
+# ==================================================
+
+def analyze_smc(df, ticker):
 
     signals = []
+    events = []
 
-    if df.empty or len(df) < 4:
-        return signals
+    if df.empty or len(df) < 20:
+        return signals, events, {}
 
-    for i in range(2, len(df) - 1):
+    df = df.copy()
 
-        first_time = df.index[i]
-        second_time = df.index[i + 1]
+    # Swing points
+    for i in range(2, len(df) - 2):
 
-        first = df.iloc[i]
-        second = df.iloc[i + 1]
-        two_candles_before = df.iloc[i - 2]
-        middle_candle = df.iloc[i - 1]
+        candle = df.iloc[i]
 
-        # Both candles must be consecutive 5-minute candles
-        if second_time - first_time != timedelta(minutes=5):
-            continue
+        if candle["High"] >= df["High"].iloc[i-2:i+3].max():
 
-        # FVG candles must also be consecutive
+            events.append({
+                "Time": df.index[i],
+                "Type": "Swing High",
+                "Price": float(candle["High"])
+            })
+
+        if candle["Low"] <= df["Low"].iloc[i-2:i+3].min():
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "Swing Low",
+                "Price": float(candle["Low"])
+            })
+
+    # Liquidity and structure
+    bull_sweeps = []
+    bear_sweeps = []
+
+    last_structure = None
+
+    for i in range(10, len(df)):
+
+        candle = df.iloc[i]
+        previous = df.iloc[i-10:i]
+
+        old_high = previous["High"].max()
+        old_low = previous["Low"].min()
+
+        # SSL Sweep
         if (
-            first_time - df.index[i - 1] != timedelta(minutes=5)
-            or df.index[i - 1] - df.index[i - 2]
-            != timedelta(minutes=5)
+            candle["Low"] < old_low
+            and candle["Close"] > old_low
         ):
+
+            bull_sweeps.append(i)
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "SSL Sweep",
+                "Price": float(candle["Low"])
+            })
+
+        # BSL Sweep
+        if (
+            candle["High"] > old_high
+            and candle["Close"] < old_high
+        ):
+
+            bear_sweeps.append(i)
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "BSL Sweep",
+                "Price": float(candle["High"])
+            })
+
+        # BOS / CHOCH / MSS
+        previous_structure = df.iloc[max(0, i-5):i]
+
+        if len(previous_structure) >= 3:
+
+            if candle["Close"] > previous_structure["High"].max():
+
+                event_type = (
+                    "Bullish CHOCH"
+                    if last_structure == "BEARISH"
+                    else "Bullish BOS"
+                )
+
+                if last_structure is None:
+                    event_type = "Bullish BOS"
+
+                if (
+                    bull_sweeps
+                    and i > bull_sweeps[-1]
+                    and last_structure == "BEARISH"
+                ):
+                    event_type = "Bullish MSS"
+
+                last_structure = "BULLISH"
+
+                events.append({
+                    "Time": df.index[i],
+                    "Type": event_type,
+                    "Price": float(candle["Close"])
+                })
+
+            elif candle["Close"] < previous_structure["Low"].min():
+
+                event_type = (
+                    "Bearish CHOCH"
+                    if last_structure == "BULLISH"
+                    else "Bearish BOS"
+                )
+
+                if last_structure is None:
+                    event_type = "Bearish BOS"
+
+                if (
+                    bear_sweeps
+                    and i > bear_sweeps[-1]
+                    and last_structure == "BULLISH"
+                ):
+                    event_type = "Bearish MSS"
+
+                last_structure = "BEARISH"
+
+                events.append({
+                    "Time": df.index[i],
+                    "Type": event_type,
+                    "Price": float(candle["Close"])
+                })
+
+    # ==================================================
+    # FVG / IFVG
+    # ==================================================
+
+    fvg_zones = []
+
+    for i in range(2, len(df)):
+
+        first = df.iloc[i-2]
+        middle = df.iloc[i-1]
+        last = df.iloc[i]
+
+        # Bullish FVG
+        if last["Low"] > first["High"]:
+
+            low = float(first["High"])
+            high = float(last["Low"])
+
+            zone = {
+                "Type": "Bullish FVG",
+                "Time": df.index[i],
+                "Low": low,
+                "High": high
+            }
+
+            fvg_zones.append(zone)
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "Bullish FVG",
+                "Price": high,
+                "Zone Low": low,
+                "Zone High": high
+            })
+
+        # Bearish FVG
+        elif last["High"] < first["Low"]:
+
+            low = float(last["High"])
+            high = float(first["Low"])
+
+            zone = {
+                "Type": "Bearish FVG",
+                "Time": df.index[i],
+                "Low": low,
+                "High": high
+            }
+
+            fvg_zones.append(zone)
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "Bearish FVG",
+                "Price": low,
+                "Zone Low": low,
+                "Zone High": high
+            })
+
+    # IFVG detection
+    for zone in fvg_zones:
+
+        later = df[df.index > zone["Time"]]
+
+        if later.empty:
             continue
 
-        # Only today's signals
-        if second_time.date() != now.date():
+        if zone["Type"] == "Bullish FVG":
+
+            if (later["Close"] < zone["Low"]).any():
+
+                events.append({
+                    "Time": later.index[
+                        later["Close"].values < zone["Low"]
+                    ][0],
+                    "Type": "Bearish IFVG",
+                    "Price": zone["Low"],
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
+
+        else:
+
+            if (later["Close"] > zone["High"]).any():
+
+                events.append({
+                    "Time": later.index[
+                        later["Close"].values > zone["High"]
+                    ][0],
+                    "Type": "Bullish IFVG",
+                    "Price": zone["High"],
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
+
+    # ==================================================
+    # ORDER BLOCK / BREAKER / MITIGATION
+    # ==================================================
+
+    ob_zones = []
+
+    for event in events:
+
+        if event["Type"] not in [
+            "Bullish BOS", "Bullish CHOCH",
+            "Bullish MSS", "Bearish BOS",
+            "Bearish CHOCH", "Bearish MSS"
+        ]:
             continue
 
-        signal_time = second_time + timedelta(minutes=5)
+        event_time = event["Time"]
 
-        # User's requested scan window: 9:30 AM to 3:30 PM
-        if signal_time.time() < time(9, 30):
+        pos = df.index.get_loc(event_time)
+
+        if isinstance(pos, slice):
             continue
 
-        if signal_time.time() > time(15, 30):
-            continue
-
-        # CONDITION 1: Both candles must be GREEN
-        first_green = first["Close"] > first["Open"]
-        second_green = second["Close"] > second["Open"]
-
-        if not first_green or not second_green:
-            continue
-
-        # CONDITION 2: Second Open within 0% to 0.30%
-        # Difference is absolute, so wick/sweep is allowed
-        open_difference = (
-            abs(second["Open"] - first["Close"])
-            / first["Close"]
-        ) * 100
-
-        if open_difference > 0.30:
-            continue
-
-        # CONDITION 3: Second Close must be higher
-        if second["Close"] <= first["Close"]:
-            continue
-
-        # CONDITION 4: Bullish FVG on first candle
-        # First candle Low > High of the candle two bars before it
-        bullish_fvg = (
-            first["Low"] > two_candles_before["High"]
+        direction = (
+            "BULLISH"
+            if event["Type"].startswith("Bullish")
+            else "BEARISH"
         )
 
-        # CONDITION 5: Marubozu checks
-        first_marubozu = is_bullish_marubozu(first)
-        second_marubozu = is_bullish_marubozu(second)
+        for j in range(pos-1, max(pos-6, -1), -1):
 
-        both_marubozu = (
-            first_marubozu and second_marubozu
-        )
+            candle = df.iloc[j]
 
-        # Any ONE of these three conditions is enough
-        qualifies = (
-            bullish_fvg
-            or second_marubozu
-            or both_marubozu
-        )
+            opposite = (
+                candle["Close"] < candle["Open"]
+                if direction == "BULLISH"
+                else candle["Close"] > candle["Open"]
+            )
 
-        if not qualifies:
+            if opposite:
+
+                zone = {
+                    "Type": direction + " Order Block",
+                    "Time": df.index[j],
+                    "Low": float(candle["Low"]),
+                    "High": float(candle["High"])
+                }
+
+                ob_zones.append(zone)
+
+                events.append({
+                    "Time": df.index[j],
+                    "Type": zone["Type"],
+                    "Price": float(candle["Close"]),
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
+
+                break
+
+    # Mitigation / Breaker estimates
+    for zone in ob_zones:
+
+        later = df[df.index > zone["Time"]]
+
+        if later.empty:
             continue
 
-        reasons = []
+        if zone["Type"] == "BULLISH Order Block":
 
-        if bullish_fvg:
-            reasons.append("Bullish FVG on 1st candle")
+            if (
+                (later["Low"] <= zone["High"])
+                & (later["High"] >= zone["Low"])
+            ).any():
 
-        if second_marubozu:
-            reasons.append("2nd candle Bullish Marubozu")
+                events.append({
+                    "Time": later.index[
+                        (
+                            (later["Low"] <= zone["High"])
+                            & (later["High"] >= zone["Low"])
+                        ).values
+                    ][0],
+                    "Type": "Bullish Mitigation",
+                    "Price": zone["Low"],
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
 
-        if both_marubozu:
-            reasons.append("Both candles Bullish Marubozu")
+            if (later["Close"] < zone["Low"]).any():
+
+                events.append({
+                    "Time": later.index[
+                        (later["Close"] < zone["Low"]).values
+                    ][0],
+                    "Type": "Bearish Breaker",
+                    "Price": zone["Low"],
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
+
+        else:
+
+            if (
+                (later["Low"] <= zone["High"])
+                & (later["High"] >= zone["Low"])
+            ).any():
+
+                events.append({
+                    "Time": later.index[
+                        (
+                            (later["Low"] <= zone["High"])
+                            & (later["High"] >= zone["Low"])
+                        ).values
+                    ][0],
+                    "Type": "Bearish Mitigation",
+                    "Price": zone["High"],
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
+
+            if (later["Close"] > zone["High"]).any():
+
+                events.append({
+                    "Time": later.index[
+                        (later["Close"] > zone["High"]).values
+                    ][0],
+                    "Type": "Bullish Breaker",
+                    "Price": zone["High"],
+                    "Zone Low": zone["Low"],
+                    "Zone High": zone["High"]
+                })
+
+    # ==================================================
+    # EQUAL HIGH / EQUAL LOW
+    # ==================================================
+
+    for i in range(10, len(df)):
+
+        previous = df.iloc[i-10:i]
+
+        high = float(df["High"].iloc[i])
+        low = float(df["Low"].iloc[i])
+
+        tolerance = max(
+            high * 0.001,
+            0.01
+        )
+
+        if abs(high - previous["High"].max()) <= tolerance:
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "Equal High (EQH)",
+                "Price": high
+            })
+
+        if abs(low - previous["Low"].min()) <= tolerance:
+
+            events.append({
+                "Time": df.index[i],
+                "Type": "Equal Low (EQL)",
+                "Price": low
+            })
+
+    # ==================================================
+    # DISPLACEMENT
+    # ==================================================
+
+    body = abs(df["Close"] - df["Open"])
+
+    atr = (
+        df["High"] - df["Low"]
+    ).rolling(14).mean()
+
+    for i in range(14, len(df)):
+
+        if (
+            pd.notna(atr.iloc[i])
+            and body.iloc[i] > atr.iloc[i] * 1.5
+        ):
+
+            direction = (
+                "Bullish"
+                if df["Close"].iloc[i] > df["Open"].iloc[i]
+                else "Bearish"
+            )
+
+            events.append({
+                "Time": df.index[i],
+                "Type": direction + " Displacement",
+                "Price": float(df["Close"].iloc[i])
+            })
+
+    # ==================================================
+    # PREMIUM / DISCOUNT / OTE
+    # ==================================================
+
+    range_high = float(df["High"].max())
+    range_low = float(df["Low"].min())
+
+    equilibrium = (range_high + range_low) / 2
+
+    current = df.iloc[-1]
+
+    if current["Close"] > equilibrium:
+        pd_zone = "PREMIUM"
+    elif current["Close"] < equilibrium:
+        pd_zone = "DISCOUNT"
+    else:
+        pd_zone = "EQUILIBRIUM"
+
+    # Simplified OTE reference from 30-day range
+    ote = {}
+
+    if current["Close"] >= equilibrium:
+
+        ote["Low"] = range_high - (
+            range_high - range_low
+        ) * 0.79
+
+        ote["High"] = range_high - (
+            range_high - range_low
+        ) * 0.62
+
+        ote["Direction"] = "Bullish reference"
+
+    else:
+
+        ote["Low"] = range_low + (
+            range_high - range_low
+        ) * 0.62
+
+        ote["High"] = range_low + (
+            range_high - range_low
+        ) * 0.79
+
+        ote["Direction"] = "Bearish reference"
+
+    # ==================================================
+    # VOLUME CONFIRMATION
+    # ==================================================
+
+    avg_volume = df["Volume"].iloc[-21:-1].mean()
+
+    volume_ok = (
+        pd.notna(avg_volume)
+        and avg_volume > 0
+        and current["Volume"] > avg_volume
+    )
+
+    # ==================================================
+    # FINAL SIGNAL
+    # ==================================================
+
+    last_index = len(df) - 1
+
+    latest_bull_sweep = (
+        bull_sweeps[-1] if bull_sweeps else None
+    )
+
+    latest_bear_sweep = (
+        bear_sweeps[-1] if bear_sweeps else None
+    )
+
+    latest_events = [
+        e for e in events
+        if e["Time"] == df.index[-1]
+    ]
+
+    bull_fvg = any(
+        e["Type"] == "Bullish FVG"
+        for e in latest_events
+    )
+
+    bear_fvg = any(
+        e["Type"] == "Bearish FVG"
+        for e in latest_events
+    )
+
+    bull_structure = [
+        e for e in events
+        if e["Type"] in [
+            "Bullish BOS", "Bullish CHOCH", "Bullish MSS"
+        ]
+    ]
+
+    bear_structure = [
+        e for e in events
+        if e["Type"] in [
+            "Bearish BOS", "Bearish CHOCH", "Bearish MSS"
+        ]
+    ]
+
+    latest_bull_break = (
+        bull_structure[-1]
+        if bull_structure else None
+    )
+
+    latest_bear_break = (
+        bear_structure[-1]
+        if bear_structure else None
+    )
+
+    bull_ok = (
+        latest_bull_sweep is not None
+        and last_index - latest_bull_sweep <= 12
+        and latest_bull_break is not None
+        and latest_bull_break["Time"] > df.index[latest_bull_sweep]
+        and bull_fvg
+        and volume_ok
+        and current["Close"] > current["Open"]
+    )
+
+    bear_ok = (
+        latest_bear_sweep is not None
+        and last_index - latest_bear_sweep <= 12
+        and latest_bear_break is not None
+        and latest_bear_break["Time"] > df.index[latest_bear_sweep]
+        and bear_fvg
+        and volume_ok
+        and current["Close"] < current["Open"]
+    )
+
+    if bull_ok:
 
         signals.append({
             "Stock": ticker.replace(".NS", ""),
-            "Signal Time": signal_time.strftime("%H:%M"),
-            "1st Candle Close": round(float(first["Close"]), 2),
-            "2nd Candle Open": round(float(second["Open"]), 2),
-            "2nd Candle Close": round(float(second["Close"]), 2),
-            "Open Difference %": round(float(open_difference), 3),
-            "FVG": "YES" if bullish_fvg else "NO",
-            "1st Marubozu": "YES" if first_marubozu else "NO",
-            "2nd Marubozu": "YES" if second_marubozu else "NO",
-            "Signal Reason": " + ".join(reasons)
+            "Signal": "BULLISH",
+            "Signal Time": df.index[-1].strftime("%d-%m %H:%M"),
+            "Price": round(float(current["Close"]), 2),
+            "FVG Low": round(
+                next(e["Zone Low"] for e in latest_events
+                     if e["Type"] == "Bullish FVG"), 2
+            ),
+            "FVG High": round(
+                next(e["Zone High"] for e in latest_events
+                     if e["Type"] == "Bullish FVG"), 2
+            ),
+            "Volume": "HIGH",
+            "Premium/Discount": pd_zone
         })
 
-    return signals
+    if bear_ok:
+
+        signals.append({
+            "Stock": ticker.replace(".NS", ""),
+            "Signal": "BEARISH",
+            "Signal Time": df.index[-1].strftime("%d-%m %H:%M"),
+            "Price": round(float(current["Close"]), 2),
+            "FVG Low": round(
+                next(e["Zone Low"] for e in latest_events
+                     if e["Type"] == "Bearish FVG"), 2
+            ),
+            "FVG High": round(
+                next(e["Zone High"] for e in latest_events
+                     if e["Type"] == "Bearish FVG"), 2
+            ),
+            "Volume": "HIGH",
+            "Premium/Discount": pd_zone
+        })
+
+    summary = {
+        "PDH / PDL": get_previous_levels(df),
+        "Range High": range_high,
+        "Range Low": range_low,
+        "Equilibrium": equilibrium,
+        "Premium / Discount": pd_zone,
+        "OTE": ote,
+        "MTF": get_mtf_analysis(df)
+    }
+
+    return signals, events, summary
 
 
-# ---------------- YAHOO DATA DOWNLOAD ----------------
+# ==================================================
+# SMC CHART
+# ==================================================
 
-def get_ticker_data(data, ticker):
+def show_smc_chart(df, ticker):
 
-    if not isinstance(data.columns, pd.MultiIndex):
-        return pd.DataFrame()
+    signals, events, summary = analyze_smc(df, ticker)
 
-    if ticker in data.columns.get_level_values(0):
-        return data[ticker].copy()
+    chart_df = df.tail(300).copy()
 
-    if ticker in data.columns.get_level_values(1):
-        return data.xs(ticker, axis=1, level=1).copy()
+    fig = go.Figure()
 
-    return pd.DataFrame()
+    fig.add_trace(go.Candlestick(
+        x=chart_df.index,
+        open=chart_df["Open"],
+        high=chart_df["High"],
+        low=chart_df["Low"],
+        close=chart_df["Close"],
+        name="Price"
+    ))
+
+    fig.add_trace(go.Bar(
+        x=chart_df.index,
+        y=chart_df["Volume"],
+        name="Volume",
+        marker_color="rgba(150,150,150,0.35)",
+        yaxis="y2"
+    ))
+
+    start = chart_df.index[0]
+    end = chart_df.index[-1] + timedelta(minutes=5)
+
+    # Previous market levels
+    levels = summary.get("PDH / PDL", {})
+
+    level_colors = {
+        "PDH": "orange",
+        "PDL": "orange",
+        "PWH": "purple",
+        "PWL": "purple",
+        "PMH": "cyan",
+        "PML": "cyan"
+    }
+
+    for name, price in levels.items():
+
+        fig.add_hline(
+            y=price,
+            line_dash="dash",
+            line_color=level_colors.get(name, "white"),
+            annotation_text=f"{name}: {price:.2f}"
+        )
+
+    # 30-day range
+    fig.add_hline(
+        y=summary["Equilibrium"],
+        line_dash="dot",
+        line_color="yellow",
+        annotation_text="EQ 50%"
+    )
+
+    # Event labels
+    visible_events = [
+        e for e in events
+        if start <= e["Time"] <= end
+    ][-60:]
+
+    for event in visible_events:
+
+        name = event["Type"]
+        price = event["Price"]
+        t = event["Time"]
+
+        if "Bullish" in name or name in [
+            "SSL Sweep", "Swing Low", "Equal Low (EQL)"
+        ]:
+            color = "lime"
+        elif "Bearish" in name or name in [
+            "BSL Sweep", "Swing High", "Equal High (EQH)"
+        ]:
+            color = "red"
+        else:
+            color = "yellow"
+
+        fig.add_annotation(
+            x=t,
+            y=price,
+            text=name,
+            showarrow=True,
+            arrowhead=2,
+            arrowcolor=color,
+            font=dict(
+                color=color,
+                size=9
+            )
+        )
+
+    # Latest FVG and OB zones
+    for event in visible_events:
+
+        if "Zone Low" not in event:
+            continue
+
+        name = event["Type"]
+
+        if "FVG" not in name and "Order Block" not in name:
+            continue
+
+        color = (
+            "rgba(0,255,0,0.15)"
+            if "Bullish" in name
+            else "rgba(255,0,0,0.15)"
+        )
+
+        fig.add_shape(
+            type="rect",
+            x0=event["Time"],
+            x1=end,
+            y0=event["Zone Low"],
+            y1=event["Zone High"],
+            fillcolor=color,
+            line=dict(width=1),
+            layer="below"
+        )
+
+    # OTE reference zone
+    ote = summary["OTE"]
+
+    fig.add_hrect(
+        y0=ote["Low"],
+        y1=ote["High"],
+        fillcolor="rgba(255,215,0,0.10)",
+        line_width=0,
+        annotation_text="OTE Reference"
+    )
+
+    fig.update_layout(
+        title=f"{ticker} - 30 Day SMC Analysis",
+        template="plotly_dark",
+        height=750,
+        xaxis_rangeslider_visible=False,
+        hovermode="x unified",
+        yaxis=dict(domain=[0.25, 1]),
+        yaxis2=dict(
+            domain=[0, 0.18],
+            title="Volume"
+        ),
+        legend=dict(orientation="h")
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True
+    )
+
+    st.caption(
+        "Historical SMC labels are rule-based estimates. "
+        "They do not verify institutional orders."
+    )
+
+    # Event history
+    st.subheader("📋 Historical SMC Events")
+
+    if events:
+
+        event_df = pd.DataFrame(events)
+
+        event_df["Time"] = pd.to_datetime(
+            event_df["Time"]
+        ).dt.strftime("%d-%m-%Y %H:%M")
+
+        st.dataframe(
+            event_df.sort_values(
+                "Time", ascending=False
+            ),
+            use_container_width=True,
+            hide_index=True
+        )
+
+    # Summary
+    st.subheader("📊 Multi-Timeframe Trend")
+
+    st.dataframe(
+        pd.DataFrame(
+            list(summary["MTF"].items()),
+            columns=["Timeframe", "Trend"]
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.subheader("📍 Market Levels")
+
+    st.json({
+        "Previous Levels": summary["PDH / PDL"],
+        "30D High": round(summary["Range High"], 2),
+        "30D Low": round(summary["Range Low"], 2),
+        "Equilibrium": round(summary["Equilibrium"], 2),
+        "Market Zone": summary["Premium / Discount"],
+        "OTE": summary["OTE"]
+    })
 
 
-# ---------------- MARKET SCANNER ----------------
+# ==================================================
+# SCAN ALL NSE STOCKS
+# ==================================================
 
 def scan_market():
 
     now = datetime.now(IST)
 
-    if now.weekday() >= 5:
-        st.warning("இன்று NSE regular market விடுமுறை நாள்.")
-        return
-
-    if not (time(9, 30) <= now.time() <= time(15, 30)):
-        st.info(
-            "NSE scanner நேரம்: காலை 9:30 முதல் மாலை 3:30 வரை. "
-            "Market நேரத்தில் மீண்டும் திறந்து பாருங்கள்."
-        )
-        return
-
     try:
         stocks = get_nse_stocks()
+
     except Exception as e:
-        st.error(f"NSE stock list கிடைக்கவில்லை: {e}")
+        st.error(f"NSE stock list error: {e}")
         return
 
-    st.write(f"**Total NSE stocks:** {len(stocks)}")
+    st.write(f"Total NSE stocks: {len(stocks)}")
 
     all_signals = []
     failed_batches = 0
 
+    batch_size = 50
+
+    total_batches = (
+        len(stocks) + batch_size - 1
+    ) // batch_size
+
     progress = st.progress(0)
     status = st.empty()
 
-    batch_size = 50
-    total_batches = (len(stocks) + batch_size - 1) // batch_size
-
-    for batch_number, start in enumerate(
-        range(0, len(stocks), batch_size), start=1
+    for batch_no, start in enumerate(
+        range(0, len(stocks), batch_size), 1
     ):
 
         batch = stocks[start:start + batch_size]
 
         try:
-            data = yf.download(
-                tickers=batch,
-                period="5d",
-                interval="5m",
-                group_by="ticker",
-                auto_adjust=False,
-                threads=True,
-                progress=False
-            )
+
+            data = download_batch(tuple(batch))
 
             for ticker in batch:
 
                 try:
-                    ticker_data = get_ticker_data(data, ticker)
 
-                    if ticker_data.empty:
+                    ticker_df = get_ticker_data(
+                        data, ticker
+                    )
+
+                    ticker_df = prepare_data(
+                        ticker_df, now
+                    )
+
+                    if ticker_df.empty:
                         continue
 
-                    ticker_data = prepare_data(ticker_data, now)
-
-                    if ticker_data.empty:
-                        continue
-
-                    found = check_pattern(
-                        ticker_data,
-                        ticker,
-                        now
+                    found, _, _ = analyze_smc(
+                        ticker_df, ticker
                     )
 
                     all_signals.extend(found)
@@ -330,86 +1139,192 @@ def scan_market():
         except Exception:
             failed_batches += 1
 
-        progress.progress(batch_number / total_batches)
+        progress.progress(
+            batch_no / total_batches
+        )
 
         status.write(
-            f"Scanning batch {batch_number}/{total_batches}..."
+            f"Scanning {batch_no}/{total_batches} "
+            f"| Signals: {len(all_signals)}"
         )
 
     progress.empty()
     status.empty()
 
-    st.subheader("📊 Scanner Results")
+    st.session_state["smc_results"] = all_signals
 
-    if all_signals:
-
-        results = pd.DataFrame(all_signals)
-
-        results = results.drop_duplicates(
-            subset=["Stock", "Signal Time"],
-            keep="last"
-        )
-
-        results = results.sort_values(
-            by="Signal Time",
-            ascending=False
-        )
-
-        st.success(f"Total Signal Found: {len(results)}")
-
-        st.dataframe(
-            results,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        csv = results.to_csv(index=False).encode("utf-8")
-
-        st.download_button(
-            "Download Signals CSV",
-            data=csv,
-            file_name="NSE_FVG_Marubozu_Signals.csv",
-            mime="text/csv"
-        )
-
-    else:
-        st.warning("இப்போது எந்த Signal-மும் கிடைக்கவில்லை.")
-
-    if failed_batches:
-        st.caption(
-            f"{failed_batches} data batches download ஆகவில்லை. "
-            "சில stocks-க்கு Yahoo Finance data கிடைக்காமல் இருக்கலாம்."
-        )
-
-    st.caption(
-        "Last scan: " + datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
+    st.session_state["smc_scan_time"] = (
+        now.strftime("%d-%m-%Y %H:%M:%S")
     )
 
+    if failed_batches:
 
-# ---------------- WEBSITE UI ----------------
+        st.warning(
+            f"{failed_batches} batches failed."
+        )
 
-st.title("📈 NSE FVG + Bullish Marubozu Scanner")
+
+# ==================================================
+# WEBSITE
+# ==================================================
+
+st.title("📊 ADVANCED NSE SMART MONEY SCANNER")
 
 st.write(
-    "NSE All Stocks | 5 Minute | "
-    "2 Green Candles | FVG / Marubozu"
+    "NSE All Stocks | 30 Days History | "
+    "5M + 15M + 1H + 4H + Daily"
 )
 
 st.info(
-    "ஒரு Signal கிடைக்க, இரண்டு Green Candles மற்றும் "
-    "Open Difference / Close நிபந்தனைகள் கட்டாயம். "
-    "FVG அல்லது Marubozu நிபந்தனைகளில் ஏதாவது ஒன்று போதும்."
+    "Liquidity + BOS + CHOCH + MSS + FVG + IFVG + "
+    "Order Block + Breaker + Mitigation + OTE + Volume"
 )
 
-st.caption(
-    "Website திறந்திருக்கும் போது ஒவ்வொரு 5 நிமிடத்திற்கும் scan நடக்கும்."
+st.warning(
+    "Yahoo Finance data may be delayed or incomplete. "
+    "Signals are educational estimates, not trading advice."
 )
 
+if "smc_results" not in st.session_state:
+    st.session_state["smc_results"] = []
 
-@st.fragment(run_every="5m")
-def live_scanner():
+if "smc_scan_time" not in st.session_state:
+    st.session_state["smc_scan_time"] = "Not scanned"
+
+if st.button(
+    "🔄 SCAN ALL NSE STOCKS",
+    type="primary",
+    use_container_width=True
+):
 
     scan_market()
 
+results = st.session_state["smc_results"]
 
-live_scanner()
+if results:
+
+    result_df = pd.DataFrame(results)
+
+    result_df = result_df.drop_duplicates(
+        subset=["Stock", "Signal"],
+        keep="last"
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric(
+        "Total Signals",
+        len(result_df)
+    )
+
+    col2.metric(
+        "Bullish",
+        len(result_df[
+            result_df["Signal"] == "BULLISH"
+        ])
+    )
+
+    col3.metric(
+        "Bearish",
+        len(result_df[
+            result_df["Signal"] == "BEARISH"
+        ])
+    )
+
+    st.subheader("📋 SMC Scanner Results")
+
+    st.dataframe(
+        result_df,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.download_button(
+        "📥 Download CSV",
+        result_df.to_csv(
+            index=False
+        ).encode("utf-8"),
+        "NSE_Advanced_SMC.csv",
+        "text/csv"
+    )
+
+    st.divider()
+
+    st.subheader("📈 Individual Stock SMC Chart")
+
+    selected_stock = st.selectbox(
+        "Select Stock",
+        sorted(result_df["Stock"].unique())
+    )
+
+    if st.button(
+        "SHOW FULL SMC CHART",
+        type="primary"
+    ):
+
+        ticker = selected_stock + ".NS"
+
+        now = datetime.now(IST)
+
+        with st.spinner(
+            f"Loading 30-day SMC data for {ticker}..."
+        ):
+
+            try:
+
+                raw = yf.download(
+                    ticker,
+                    period=YAHOO_PERIOD,
+                    interval=INTERVAL,
+                    auto_adjust=False,
+                    progress=False,
+                    timeout=30
+                )
+
+                if isinstance(
+                    raw.columns, pd.MultiIndex
+                ):
+                    raw.columns = raw.columns.get_level_values(0)
+
+                chart_data = prepare_data(
+                    raw, now
+                )
+
+                if not chart_data.empty:
+
+                    show_smc_chart(
+                        chart_data,
+                        ticker
+                    )
+
+                else:
+                    st.warning(
+                        "Chart data கிடைக்கவில்லை."
+                    )
+
+            except Exception as e:
+
+                st.error(
+                    f"Chart error: {e}"
+                )
+
+    st.caption(
+        "Last Scan: " +
+        st.session_state["smc_scan_time"]
+    )
+
+else:
+
+    st.info(
+        "முதலில் SCAN ALL NSE STOCKS அழுத்துங்கள். "
+        "Signal கிடைத்தால் Stock Chart பார்க்கலாம்."
+    )
+
+st.divider()
+
+st.caption(
+    "30-day historical analysis. "
+    "Only completed 5-minute candles are used. "
+    "Manual scan required. "
+    "Yahoo Finance data is not guaranteed live."
+)
